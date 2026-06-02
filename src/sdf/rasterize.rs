@@ -28,7 +28,7 @@ pub mod bench_counters {
     pub static PAD_SUM: AtomicU64 = AtomicU64::new(0);
     /// 最大单字形窗口像素
     pub static MAX_WINDOW: AtomicU64 = AtomicU64::new(0);
-    /// 巨型字降分辨率开关：true 时强制 factor=1（精确光栅化，不降采样），
+    /// 巨型字降分辨率开关：true 时缓冲取满设备窗口分辨率（精确光栅化，不降采样），
     /// 供 A/B 工具量化「精确 vs 降采样」的视觉差。生产恒为 false（启用降采样）。
     pub static DISABLE_DOWNSAMPLE: AtomicBool = AtomicBool::new(false);
 
@@ -479,10 +479,9 @@ fn device_sample_phase_y() -> f32 {
     *PHASE.get_or_init(|| env_f32_any("SCAPUS_TMP_DEVICE_SAMPLE_PHASE_Y", 0.0))
 }
 
-/// 巨型字降采样的目标过采样倍率（保留 ≥N× 源 SDF 分辨率）。默认 4.0：
-/// A/B 实测 seq=2(`<size=400>` 巨型字) RMSE 0.056、最大差 17/255，视觉近不可见，
-/// 仍拿到 ~11% 提速；调到 2.0 提速 ~17% 但 RMSE 升到 1.07（可见模糊）。
-/// 越小越激进（buffer 越小、越快、越模糊）。普通字 factor=1，逐字节等价、零影响。
+/// 巨型字降采样的目标过采样倍率（缓冲分辨率下限 = N× 源 SDF 分辨率）。默认 4.0：
+/// 设备窗口 ≤ N× 源分辨率的字（普通字号）rw=width、scale=1.0，采样式精确退化为原式，逐字节等价。
+/// 越小越激进（buffer 越小、越快、边缘越软）。
 fn downsample_oversample() -> f32 {
     static O: OnceLock<f32> = OnceLock::new();
     *O.get_or_init(|| {
@@ -491,6 +490,25 @@ fn downsample_oversample() -> f32 {
             .and_then(|v| v.trim().parse::<f32>().ok())
             .filter(|v| v.is_finite() && *v >= 0.5 && *v <= 16.0)
             .unwrap_or(4.0)
+    })
+}
+
+/// 降采样比例上限：单个缓冲像素最多覆盖几个设备像素。默认 2.0。
+/// SDF 本是分辨率无关的——巨型字本该在设备分辨率上 shade 出 ~1px 锐利边；
+/// 若只在 oversample×src 缓冲里 shade 再双线性放大 N×，1px 的 AA 边被展宽成 Npx，
+/// 抹掉 SDF 对大字最值钱的优势。无此上限时 `<size=400>` 放大 ~3× 实测最大差 107/255、明显发糊。
+/// 此上限把缓冲拉回 ≥ 设备窗口/max_scale，将放大倍率（边缘展宽）钳在 max_scale 内，
+/// 故最坏退化与字号无关。A/B 实测 seq=2（含 `<size=400>`）max_scale=2.0：总像素 −65%、
+/// 最大差 61/255（无 cap 是 107），最坏用例经人眼验图看不出区别。
+/// 设为 1.0 等于关闭降采样（缓冲恒取满设备窗口，逐字节精确）；越大越省、边缘越软。
+fn downsample_max_scale() -> f32 {
+    static S: OnceLock<f32> = OnceLock::new();
+    *S.get_or_init(|| {
+        std::env::var("SCAPUS_DOWNSAMPLE_MAX_SCALE")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .filter(|v| v.is_finite() && *v >= 1.0 && *v <= 16.0)
+            .unwrap_or(2.0)
     })
 }
 
@@ -573,20 +591,31 @@ where
     let height = (bottom - top) as usize;
 
     // 巨型字降分辨率：源 SDF 仅 ~80px，富文本 <size>/<scale> 把它放大到上千像素是纯过采样。
-    // 在缩小的缓冲区光栅化（保持 ≥OVERSAMPLE× 源分辨率，视觉近无损），再双线性放大贴回设备矩形。
-    // factor=1 时（普通字：window < 2*OVERSAMPLE*src）公式精确退化为原式，逐字节等价。
+    // 缓冲分辨率取 min(设备窗口, max(OVERSAMPLE×源SDF分辨率, 设备窗口/MAX_SCALE))，
+    // 再双线性放大贴回设备矩形。
+    //
+    // 两道下限的分工：
+    // - OVERSAMPLE×src：中小字的下限，保证缩到 ≥OVERSAMPLE× 源分辨率，量化掉中间带过采样。
+    // - 设备窗口/MAX_SCALE：巨型字的下限，把放大倍率（缓冲→设备）钳在 MAX_SCALE 内，
+    //   防止在小缓冲里 shade 出 AA 边再放大 N× 抹糊（`<size=400>` 巨型字的退化源）。
+    //   字越大这条越占主导，缓冲随窗口按比例增长，边缘展宽恒 ≤ MAX_SCALE。
+    // 设备窗口 ≤ OVERSAMPLE×src（普通字）时 rw=width,rh=height,scale=1.0，
+    // 采样公式精确退化为原式，逐字节等价、零影响。
     let oversample = downsample_oversample();
-    let factor = if bench_counters::DISABLE_DOWNSAMPLE.load(std::sync::atomic::Ordering::Relaxed) {
-        1usize
-    } else {
-        let fx = width as f32 / (oversample * src_w.max(1.0));
-        let fy = height as f32 / (oversample * src_h.max(1.0));
-        fx.min(fy).floor().max(1.0) as usize
-    };
-    let factor_f = factor as f32;
-    // 光栅化缓冲分辨率（降采样后）。factor=1 时 rw=width, rh=height。
-    let rw = width.div_ceil(factor);
-    let rh = height.div_ceil(factor);
+    let max_scale = downsample_max_scale();
+    let (rw, rh) =
+        if bench_counters::DISABLE_DOWNSAMPLE.load(std::sync::atomic::Ordering::Relaxed) {
+            (width, height)
+        } else {
+            let floor_w = (oversample * src_w.max(1.0)).max(width as f32 / max_scale);
+            let floor_h = (oversample * src_h.max(1.0)).max(height as f32 / max_scale);
+            let target_w = floor_w.ceil() as usize;
+            let target_h = floor_h.ceil() as usize;
+            (width.min(target_w).max(1), height.min(target_h).max(1))
+        };
+    // 每个缓冲像素覆盖的设备像素数（连续）。rw=width 时恰为 1.0（整数同值相除位精确）。
+    let scale_x = width as f32 / rw as f32;
+    let scale_y = height as f32 / rh as f32;
 
     let mut pixels = vec![0u8; rw * rh * 4];
     let phase_x = device_sample_phase_x();
@@ -610,9 +639,10 @@ where
         MAX_WINDOW.fetch_max(win, Ordering::Relaxed);
     }
 
-    // ss_step 含 factor：factor=1 时 = 1/grid（与原式一致）；factor>1 时每个缓冲像素
-    // 覆盖 factor 宽的设备区域，采样点落在该区域内。
-    let ss_step = factor_f / supersample_grid as f32;
+    // ss_step 含 scale：scale=1 时 = 1/grid（与原式一致）；scale>1 时每个缓冲像素
+    // 覆盖 scale 宽的设备区域，采样点落在该区域内。X/Y 现在可不同比例。
+    let ss_step_x = scale_x / supersample_grid as f32;
+    let ss_step_y = scale_y / supersample_grid as f32;
     let inv_ss = 1.0 / (supersample_grid * supersample_grid) as f32;
 
     // 每行像素相互独立，按行切分并行光栅化。每像素计算只读共享状态
@@ -630,12 +660,12 @@ where
                     for sy in 0..supersample_grid {
                         for sx in 0..supersample_grid {
                             let device_x = left as f32
-                                + rx as f32 * factor_f
-                                + (sx as f32 + 0.5) * ss_step
+                                + rx as f32 * scale_x
+                                + (sx as f32 + 0.5) * ss_step_x
                                 + phase_x;
                             let device_y = top as f32
-                                + ry as f32 * factor_f
-                                + (sy as f32 + 0.5) * ss_step
+                                + ry as f32 * scale_y
+                                + (sy as f32 + 0.5) * ss_step_y
                                 + phase_y;
                             let local = inv.map_point((device_x, device_y));
                             let Some(sample) = shade_pixel(local.x, local.y) else {
@@ -662,7 +692,7 @@ where
             .reduce(|| false, |a, b| a || b)
     });
 
-    // 缓冲分辨率 rw×rh 放大贴回设备矩形 width×height。factor=1 时 1:1 → Nearest 逐字节等价。
+    // 缓冲分辨率 rw×rh 放大贴回设备矩形 width×height。rw=width 时 1:1 → Nearest 逐字节等价。
     painted
         && draw_rgba_bitmap_identity(
             canvas,
